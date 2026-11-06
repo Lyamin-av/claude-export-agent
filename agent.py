@@ -21,7 +21,7 @@ load_dotenv()  # до импорта tools: там читаются переме
 import os  # noqa: E402
 
 import llm  # noqa: E402
-from tools import HANDLERS, TOOLS, WORK_DIR  # noqa: E402
+from tools import HANDLERS, TOOLS, VALIDATORS, WORK_DIR  # noqa: E402
 
 RUNS_DIR = WORK_DIR / "runs"
 
@@ -71,6 +71,15 @@ def run_tool(name: str, args: dict) -> tuple[str, bool]:
     """Исполняет инструмент. Возвращает (результат JSON, была ли ошибка)."""
     if name not in HANDLERS:
         return f"Неизвестный инструмент {name}", True
+    if name in VALIDATORS:
+        # Проверка формата до подтверждения: человек видит уже исправленный вариант
+        try:
+            problems = VALIDATORS[name](**args)
+        except TypeError as e:
+            return f"{type(e).__name__}: {e}", True
+        if problems:
+            return ("Не выполнено, проверка формата не пройдена: " + "; ".join(problems) +
+                    ". Исправь и вызови инструмент снова."), True
     if name in NEEDS_CONFIRMATION:
         print(f"\n⚠️  Агент хочет выполнить {name}({json.dumps(args, ensure_ascii=False)})")
         if input("Разрешить? [y/N]: ").strip().lower() not in ("y", "yes", "д", "да"):

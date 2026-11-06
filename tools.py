@@ -423,6 +423,35 @@ def git_commit_and_push(message: str) -> dict:
     return {"status": "pushed", "commit": _git("rev-parse", "--short", "HEAD").strip()}
 
 
+# ---------- Проверки аргументов до исполнения ----------
+# Формат, который можно проверить кодом, проверяем кодом, а не надеемся на промпт.
+# Проверка вызывается в agent.py ДО запроса подтверждения у человека.
+_EMPTY_SECTION = re.compile(
+    r"^\s*[-*•]?\s*(?:[^:\n]{2,60}:\s*)?(нет|0|—|-|отсутствуют|пусто|none)\.?\s*$",
+    re.IGNORECASE)
+
+
+def check_commit_message(message: str) -> list[str]:
+    """Возвращает список нарушений формата сообщения коммита (пустой — всё в порядке)."""
+    problems = []
+    lines = message.strip("\n").splitlines()
+    first = lines[0] if lines else ""
+    if not first.startswith("Claude export "):
+        problems.append(f"первая строка должна начинаться с «Claude export », сейчас: «{first[:80]}»")
+    if len(first) > 72:
+        problems.append(f"первая строка длиннее 72 символов ({len(first)})")
+    if len(lines) > 1 and lines[1].strip():
+        problems.append("вторая строка должна быть пустой")
+    empty = [ln.strip() for ln in lines[1:] if _EMPTY_SECTION.match(ln)]
+    if empty:
+        problems.append("пустые разделы не пиши, убери эти строки: " +
+                        "; ".join(f"«{e}»" for e in empty[:5]))
+    return problems
+
+
+VALIDATORS = {"git_commit_and_push": check_commit_message}
+
+
 # ---------- Описания для модели ----------
 def _tool(fn, description, props=None, required=None):
     return {
