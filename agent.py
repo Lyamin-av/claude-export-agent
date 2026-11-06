@@ -84,6 +84,19 @@ def _mark_history_for_cache(messages: list) -> None:
     last["content"][-1]["cache_control"] = CACHE
 
 
+MAX_TRUNCATIONS = 3  # столько обрывов ответа подряд — и останавливаемся
+
+
+def _append_note(messages: list, text: str) -> None:
+    """Добавляет пояснение для модели в последнее сообщение пользователя.
+    Два сообщения user подряд API не принимает, поэтому дописываем в существующее
+    (после tool_result — так требует API)."""
+    last = messages[-1]
+    if isinstance(last["content"], str):
+        last["content"] = [{"type": "text", "text": last["content"]}]
+    last["content"].append({"type": "text", "text": text})
+
+
 def run_tool(name: str, args: dict) -> tuple[str, bool]:
     """Исполняет инструмент. Возвращает (результат JSON, была ли ошибка)."""
     if name not in HANDLERS:
@@ -163,6 +176,7 @@ def main(task: str) -> None:
     client = anthropic.Anthropic()  # ключ берётся из ANTHROPIC_API_KEY
     messages = [{"role": "user", "content": task}]
     log, outcome = RunLog(task), "unknown"
+    truncations = 0  # сколько ответов подряд оборвалось по max_tokens
 
     try:
         for step in range(1, MAX_STEPS + 1):
@@ -179,9 +193,32 @@ def main(task: str) -> None:
                 if block.type == "text" and block.text.strip():
                     print(f"\n🤖 {block.text}")
 
-            if response.stop_reason != "tool_use":
+            # Почему модель остановилась — разбираем каждый случай явно
+            if response.stop_reason == "end_turn":
                 outcome = "finished"
                 return  # модель закончила
+
+            if response.stop_reason == "max_tokens":
+                # Ответ оборвался на середине. Обрезанный ответ (в нём может быть
+                # недописанный вызов инструмента) убираем из истории и просим повторить короче.
+                truncations += 1
+                print(f"\n⚠️  Ответ модели оборвался по лимиту длины ({truncations}/{MAX_TRUNCATIONS}).")
+                if truncations >= MAX_TRUNCATIONS:
+                    outcome = "max_tokens"
+                    print("Остановлено: модель несколько раз подряд не уложилась в лимит ответа.")
+                    return
+                messages.pop()
+                _append_note(messages, "Твой предыдущий ответ оборвался по лимиту длины. "
+                                       "Повтори его короче.")
+                continue
+
+            if response.stop_reason != "tool_use":
+                # refusal и другие причины, которых сценарий не ожидает
+                outcome = f"stopped: {response.stop_reason}"
+                print(f"\nОстановлено: неожиданная причина остановки модели — {response.stop_reason}.")
+                return
+
+            truncations = 0  # нормальный ответ — счётчик обрывов сбрасываем
 
             tool_results = []
             for block in response.content:
