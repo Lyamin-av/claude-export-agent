@@ -64,6 +64,7 @@ SYSTEM = """Ты агент, который архивирует экспорт 
 
 
 MAX_TRUNCATIONS = 3  # столько обрывов ответа подряд — и останавливаемся
+SHOW_REASONING = os.getenv("SHOW_REASONING", "1") != "0"  # печатать размышления модели
 
 
 def run_tool(name: str, args: dict) -> tuple[str, bool]:
@@ -145,6 +146,7 @@ def main(task: str) -> None:
     client.start(task)
     log, outcome = RunLog(task), "unknown"
     truncations = 0  # сколько ответов подряд оборвалось по max_tokens
+    asked_for_report = False  # просили ли уже отчёт после пустого финального ответа
     print(f"Провайдер: {PROVIDER}, модель: {MODEL}")
 
     try:
@@ -154,11 +156,22 @@ def main(task: str) -> None:
             log.add_response(step, response, time.time() - t0)
 
             # Текст, который модель пишет между вызовами — это её "рассуждение вслух"
+            if response.reasoning and SHOW_REASONING:
+                r = response.reasoning.replace("\n", " ")
+                print(f"\n💭 {r[:300]}{'…' if len(r) > 300 else ''}")
             if response.text:
                 print(f"\n🤖 {response.text}")
 
             # Почему модель остановилась — разбираем каждый случай явно
             if response.stop == llm.END:
+                if not response.text and not asked_for_report:
+                    # Модель закончила, но текста нет: например, отчёт целиком
+                    # остался в размышлениях (так бывает у локальных моделей). Просим один раз.
+                    asked_for_report = True
+                    print("\n⚠️  Модель закончила без итогового текста — прошу отчёт.")
+                    client.add_note("Ты закончил, но не написал итоговый отчёт. "
+                                    "Напиши его обычным текстом ответа.")
+                    continue
                 outcome = "finished"
                 return  # модель закончила
 

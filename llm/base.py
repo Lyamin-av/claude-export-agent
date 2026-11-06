@@ -29,6 +29,7 @@ class ToolCall:
 class LLMResponse:
     stop: str                     # END / TOOL_USE / MAX_TOKENS / иная причина как есть
     text: str = ""
+    reasoning: str = ""           # размышления модели (thinking), если сервер их отдаёт отдельно
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: dict = field(default_factory=dict)   # ключи как в USAGE_KEYS
     raw: dict = field(default_factory=dict)     # ответ провайдера целиком — для журнала

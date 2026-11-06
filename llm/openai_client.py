@@ -91,6 +91,8 @@ class OpenAIClient(LLMClient):
         return LLMResponse(
             stop=stop,
             text=(msg.content or "").strip(),
+            # Ollama кладёт размышления (thinking) в нестандартное поле "reasoning"
+            reasoning=str((msg.model_extra or {}).get("reasoning") or "").strip(),
             tool_calls=calls,
             usage={"input_tokens": getattr(u, "prompt_tokens", 0) or 0,
                    "output_tokens": getattr(u, "completion_tokens", 0) or 0},
