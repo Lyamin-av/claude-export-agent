@@ -4,7 +4,9 @@
 Весь "агент" — это цикл ниже:
   1) отправляем модели задачу + описания инструментов;
   2) если модель просит вызвать инструмент — исполняем его и отдаём результат;
-  3) повторяем, пока модель не ответит текстом (stop_reason == "end_turn").
+  3) повторяем, пока модель не ответит текстом.
+Формат общения с конкретным API (Anthropic, OpenAI-совместимый, например Ollama)
+спрятан в адаптерах пакета llm/: здесь только логика агента.
 """
 import json
 import sys
@@ -16,14 +18,16 @@ from dotenv import load_dotenv
 
 load_dotenv()  # до импорта tools: там читаются переменные из .env
 
-import anthropic  # noqa: E402
 import os  # noqa: E402
 
+import llm  # noqa: E402
 from tools import HANDLERS, TOOLS, WORK_DIR  # noqa: E402
 
 RUNS_DIR = WORK_DIR / "runs"
 
-MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
+# Провайдер и модель — из .env: PROVIDER=anthropic|openai, MODEL=...
+PROVIDER = llm.provider_name()
+MODEL = llm.model_name()
 MAX_STEPS = 25  # ограничитель: агент не может крутиться бесконечно
 
 # Действия, которые нельзя отменить, — только после "да" от человека.
@@ -59,42 +63,7 @@ SYSTEM = """Ты агент, который архивирует экспорт 
 - В конце дай короткий отчёт на русском: что получено, что закоммичено, что не получилось."""
 
 
-# ---------- Кэширование промпта ----------
-# Каждый шаг модель получает заново: инструменты + системный промпт + всю историю.
-# Начало запроса от шага к шагу не меняется, поэтому его можно кэшировать: повторное
-# чтение из кэша стоит ~10% обычной цены. Отмечаем точки кэша (cache_control):
-#  1) системный промпт — кэширует описания инструментов и промпт (они идут первыми);
-#  2) последний блок истории — кэширует всю переписку до текущего шага.
-# API допускает не больше 4 точек, поэтому старую точку в истории снимаем.
-# Кэш срабатывает, только если кэшируемое начало длиннее минимума для модели
-# (порядка тысячи-двух тысяч токенов), поэтому на первом шаге его может не быть.
-CACHE = {"type": "ephemeral"}
-SYSTEM_BLOCKS = [{"type": "text", "text": SYSTEM, "cache_control": CACHE}]
-
-
-def _mark_history_for_cache(messages: list) -> None:
-    for msg in messages:
-        if isinstance(msg["content"], list):
-            for block in msg["content"]:
-                if isinstance(block, dict):
-                    block.pop("cache_control", None)
-    last = messages[-1]
-    if isinstance(last["content"], str):
-        last["content"] = [{"type": "text", "text": last["content"]}]
-    last["content"][-1]["cache_control"] = CACHE
-
-
 MAX_TRUNCATIONS = 3  # столько обрывов ответа подряд — и останавливаемся
-
-
-def _append_note(messages: list, text: str) -> None:
-    """Добавляет пояснение для модели в последнее сообщение пользователя.
-    Два сообщения user подряд API не принимает, поэтому дописываем в существующее
-    (после tool_result — так требует API)."""
-    last = messages[-1]
-    if isinstance(last["content"], str):
-        last["content"] = [{"type": "text", "text": last["content"]}]
-    last["content"].append({"type": "text", "text": text})
 
 
 def run_tool(name: str, args: dict) -> tuple[str, bool]:
@@ -112,29 +81,24 @@ def run_tool(name: str, args: dict) -> tuple[str, bool]:
         return f"{type(e).__name__}: {e}", True
 
 
-def _dump(block) -> dict:
-    """Блок ответа модели -> обычный dict для журнала."""
-    if hasattr(block, "model_dump"):
-        return block.model_dump(mode="json")
-    return {k: v for k, v in vars(block).items()}
-
-
 class RunLog:
     """Журнал запуска: все шаги, вызовы инструментов, токены и стоимость.
     Сохраняется в work/runs/<время>.json даже при ошибке или Ctrl+C."""
 
     def __init__(self, task: str):
         self.started = datetime.now(timezone.utc)
-        self.data = {"task": task, "model": MODEL, "started_at": self.started.isoformat(),
-                     "steps": [], "usage": {}}
-        self.usage = {"input_tokens": 0, "output_tokens": 0,
-                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+        self.data = {"task": task, "provider": PROVIDER, "model": MODEL,
+                     "started_at": self.started.isoformat(), "steps": [], "usage": {}}
+        self.usage = {k: 0 for k in llm.USAGE_KEYS}
+        self.llm_seconds = 0.0  # сколько ждали модель; для локальной модели — главная метрика
 
-    def add_response(self, step: int, response) -> None:
+    def add_response(self, step: int, response: "llm.LLMResponse", sec: float) -> None:
         for k in self.usage:
-            self.usage[k] += getattr(response.usage, k, 0) or 0
-        self.data["steps"].append({"step": step, "stop_reason": response.stop_reason,
-                                   "content": [_dump(b) for b in response.content],
+            self.usage[k] += response.usage.get(k, 0) or 0
+        self.llm_seconds += sec
+        self.data["steps"].append({"step": step, "stop": response.stop,
+                                   "llm_seconds": round(sec, 1),
+                                   "usage": response.usage, "response": response.raw,
                                    "tool_results": []})
 
     def add_tool_result(self, name: str, args: dict, output: str, is_error: bool, sec: float) -> None:
@@ -155,6 +119,7 @@ class RunLog:
 
     def save(self, outcome: str) -> Path:
         self.data.update(outcome=outcome, usage=self.usage, cost_usd=self.cost(),
+                         llm_seconds=round(self.llm_seconds, 1),
                          finished_at=datetime.now(timezone.utc).isoformat())
         path = RUNS_DIR / (self.started.astimezone().strftime("%Y-%m-%d_%H-%M-%S") + ".json")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,38 +132,37 @@ class RunLog:
         n = lambda x: f"{x:,}".replace(",", " ")
         line = (f"Токены: ввод {n(u['input_tokens'])}, вывод {n(u['output_tokens'])}, "
                 f"кэш {n(u['cache_read_input_tokens'])}/{n(u['cache_creation_input_tokens'])} (чтение/запись)")
-        line += f" · стоимость ≈ ${c:.4f}" if c is not None else \
-            " · стоимость: укажите PRICE_INPUT_PER_MTOK и PRICE_OUTPUT_PER_MTOK в .env"
+        line += f" · ожидание модели {self.llm_seconds:.0f} с"
+        if c is not None:
+            line += f" · стоимость ≈ ${c:.4f}"
+        elif PROVIDER == "anthropic":
+            line += " · стоимость: укажите PRICE_INPUT_PER_MTOK и PRICE_OUTPUT_PER_MTOK в .env"
         return line
 
 
 def main(task: str) -> None:
-    client = anthropic.Anthropic()  # ключ берётся из ANTHROPIC_API_KEY
-    messages = [{"role": "user", "content": task}]
+    client = llm.make_client(SYSTEM, TOOLS)
+    client.start(task)
     log, outcome = RunLog(task), "unknown"
     truncations = 0  # сколько ответов подряд оборвалось по max_tokens
+    print(f"Провайдер: {PROVIDER}, модель: {MODEL}")
 
     try:
         for step in range(1, MAX_STEPS + 1):
-            _mark_history_for_cache(messages)
-            response = client.messages.create(
-                model=MODEL, max_tokens=4096, system=SYSTEM_BLOCKS,
-                tools=TOOLS, messages=messages,
-            )
-            log.add_response(step, response)
-            messages.append({"role": "assistant", "content": response.content})
+            t0 = time.time()
+            response = client.chat()
+            log.add_response(step, response, time.time() - t0)
 
             # Текст, который модель пишет между вызовами — это её "рассуждение вслух"
-            for block in response.content:
-                if block.type == "text" and block.text.strip():
-                    print(f"\n🤖 {block.text}")
+            if response.text:
+                print(f"\n🤖 {response.text}")
 
             # Почему модель остановилась — разбираем каждый случай явно
-            if response.stop_reason == "end_turn":
+            if response.stop == llm.END:
                 outcome = "finished"
                 return  # модель закончила
 
-            if response.stop_reason == "max_tokens":
+            if response.stop == llm.MAX_TOKENS:
                 # Ответ оборвался на середине. Обрезанный ответ (в нём может быть
                 # недописанный вызов инструмента) убираем из истории и просим повторить короче.
                 truncations += 1
@@ -207,33 +171,37 @@ def main(task: str) -> None:
                     outcome = "max_tokens"
                     print("Остановлено: модель несколько раз подряд не уложилась в лимит ответа.")
                     return
-                messages.pop()
-                _append_note(messages, "Твой предыдущий ответ оборвался по лимиту длины. "
-                                       "Повтори его короче.")
+                client.drop_last_response()
+                client.add_note("Твой предыдущий ответ оборвался по лимиту длины. Повтори его короче.")
                 continue
 
-            if response.stop_reason != "tool_use":
+            if response.stop != llm.TOOL_USE:
                 # refusal и другие причины, которых сценарий не ожидает
-                outcome = f"stopped: {response.stop_reason}"
-                print(f"\nОстановлено: неожиданная причина остановки модели — {response.stop_reason}.")
+                outcome = f"stopped: {response.stop}"
+                print(f"\nОстановлено: неожиданная причина остановки модели — {response.stop}.")
                 return
 
             truncations = 0  # нормальный ответ — счётчик обрывов сбрасываем
 
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                print(f"\n🔧 [{step}] {block.name}({json.dumps(block.input, ensure_ascii=False)})")
+            if not response.tool_calls:
+                # Сервер сказал «вызов инструментов», но вызовов нет — сообщаем модели факт
+                client.add_note("В твоём ответе нет ни одного вызова инструмента. "
+                                "Вызови нужный инструмент или дай итоговый отчёт.")
+                continue
+
+            results = []
+            for call in response.tool_calls:
+                print(f"\n🔧 [{step}] {call.name}({json.dumps(call.args, ensure_ascii=False)})")
                 t0 = time.time()
-                output, is_error = run_tool(block.name, block.input)
-                log.add_tool_result(block.name, block.input, output, is_error, time.time() - t0)
+                if call.parse_error:
+                    # Модель прислала битые аргументы: не исполняем, а сообщаем факт
+                    output, is_error = f"Вызов не выполнен: {call.parse_error}", True
+                else:
+                    output, is_error = run_tool(call.name, call.args)
+                log.add_tool_result(call.name, call.args, output, is_error, time.time() - t0)
                 print(("   ❌ " if is_error else "   ✅ ") + output[:500])
-                tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id,
-                    "content": output, "is_error": is_error,
-                })
-            messages.append({"role": "user", "content": tool_results})
+                results.append((call, output, is_error))
+            client.add_tool_results(results)
 
         outcome = "step_limit"
         print(f"\nОстановлено: превышен лимит в {MAX_STEPS} шагов.")

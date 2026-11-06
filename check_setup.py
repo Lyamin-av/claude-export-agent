@@ -16,7 +16,8 @@ def check(name, fn):
 
 
 def env():
-    need = ["ANTHROPIC_API_KEY", "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "REPO_URL", "ARCHIVE_DIR"]
+    provider = os.getenv("PROVIDER", "anthropic").lower()
+    need = (["ANTHROPIC_API_KEY"] if provider == "anthropic" else []) + ["GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "REPO_URL", "ARCHIVE_DIR"]
     missing = [k for k in need if not os.getenv(k) or "..." in os.getenv(k) or "<" in os.getenv(k)
                or os.getenv(k).startswith(("you@", "xxxx"))]
     if missing:
@@ -25,11 +26,17 @@ def env():
 
 
 def api():
-    import anthropic
-    model = os.getenv("MODEL", "claude-sonnet-5-5")
-    r = anthropic.Anthropic().messages.create(
-        model=model, max_tokens=10, messages=[{"role": "user", "content": "Ответь словом: ок"}])
-    return f"модель {model} отвечает: {r.content[0].text.strip()}"
+    """Проверяет модель через тот же адаптер, что и агент, включая вызов инструмента."""
+    import llm
+    tool = {"name": "ping", "description": "Проверка связи. Вызови этот инструмент.",
+            "input_schema": {"type": "object", "properties": {"word": {"type": "string"}},
+                             "required": ["word"]}}
+    client = llm.make_client("Ты проверяешь связь. Вызови инструмент ping со словом ок.", [tool], 1024)
+    client.start("Проверка: вызови ping.")
+    r = client.chat()
+    calls = [f"{c.name}({c.args})" for c in r.tool_calls]
+    how = "вызвала " + ", ".join(calls) if calls else f"инструмент не вызвала, ответ: {r.text[:80]!r}"
+    return f"{llm.provider_name()} / {llm.model_name()}: {how}"
 
 
 def gmail():
@@ -52,6 +59,6 @@ def github():
 
 if __name__ == "__main__":
     check("Файл .env", env)
-    check("Claude API", api)
+    check("LLM", api)
     check("Gmail", gmail)
     check("GitHub", github)
