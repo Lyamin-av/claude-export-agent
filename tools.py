@@ -9,6 +9,7 @@
 качает ваш браузер: агент только открывает в нём ссылки и следит
 за папкой "Загрузки".
 """
+import difflib
 import email
 import html
 import imaplib
@@ -26,6 +27,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+import projects
 import render
 
 # ---------- Настройки (из .env) ----------
@@ -292,7 +294,8 @@ def _safe_extract(zf: zipfile.ZipFile, target: Path) -> int:
 
 def unpack_to_archive(manifest_path: str) -> dict:
     """Распаковывает скачанные zip в папку репозитория: ARCHIVE_DIR/<category>/.
-    Старое содержимое категории заменяется — в Git останется история версий."""
+    Старое содержимое категории заменяется — в Git останется история версий.
+    Сами zip без изменений копируются в ARCHIVE_DIR/archives/<время экспорта>/."""
     d = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     src_dir = _export_dir(d)
     by_cat: dict[str, list] = {}
@@ -314,22 +317,42 @@ def unpack_to_archive(manifest_path: str) -> dict:
             with zipfile.ZipFile(z) as zf:
                 count += _safe_extract(zf, target)
         summary.append({"category": cat, "status": "ok", "files": count})
+    # Оригиналы храним рядом: распакованные данные со временем перезаписываются,
+    # а zip — это ровно то, что отдал claude.ai. У каждого экспорта своя папка.
+    zips_dir = ARCHIVE_DIR / ZIPS_DIR_NAME / src_dir.name
+    saved = []
+    for f in d["data_files"]:
+        z = src_dir / Path(f["filename"]).name
+        if z.exists():
+            zips_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(z, zips_dir / z.name)
+            saved.append({"file": z.name, "bytes": z.stat().st_size})
     # Манифест кладём без ссылок: они одноразовые и в репозитории не нужны
     clean = {k: v for k, v in d.items() if k != "instructions"}
     clean["data_files"] = [{k: v for k, v in f.items() if k != "export_url"}
                            for f in d["data_files"]]
     (ARCHIVE_DIR / "export_manifest.json").write_text(
         json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"archive_dir": str(ARCHIVE_DIR), "categories": summary}
+    return {"archive_dir": str(ARCHIVE_DIR), "categories": summary,
+            "original_zips_dir": f"{ZIPS_DIR_NAME}/{src_dir.name}", "original_zips": saved,
+            "original_zips_total_mb": round(sum(s["bytes"] for s in saved) / 1e6, 1)}
 
 
 # ---------- Читаемый вид и сводка изменений ----------
 CHATS_DIR_NAME = "chats"
 LIST_LIMIT = 200  # максимум названий в сводке
+MOVED_LIMIT = 20  # переносы между проектами: дальше хватит чисел по маршрутам
+BY_PROJECT_DIR_NAME = "by_project"  # те же чаты + документы и память, по папкам проектов
+ZIPS_DIR_NAME = "archives"  # исходные zip экспорта, как их отдал claude.ai
+# Папки, которые целиком строятся из остальных: в «прочих изменениях» их не считаем
+DERIVED_DIRS = (CHATS_DIR_NAME, BY_PROJECT_DIR_NAME)
 
 
 def render_conversations() -> dict:
-    """Раскладывает переписку из conversations/*.json по Markdown-файлам в chats/."""
+    """Раскладывает переписку из conversations/*.json по Markdown-файлам двумя способами:
+    chats/ — все чаты одним списком; by_project/<проект>/ — чаты, документы и память
+    по проектам. Проект чата определяет projects.py; ручные привязки — в
+    chat_projects.json в корне архива."""
     files = sorted((ARCHIVE_DIR / "conversations").rglob("*.json"))
     if not files:
         raise FileNotFoundError("В архиве нет conversations/*.json — сначала unpack_to_archive.")
@@ -343,44 +366,112 @@ def render_conversations() -> dict:
         source = tmp
     else:
         source = files[0]
-    return render.render_all(source, ARCHIVE_DIR / CHATS_DIR_NAME)
+    result = render.render_all(source, ARCHIVE_DIR / CHATS_DIR_NAME)
+    result["by_project"] = render.render_by_project(
+        source, ARCHIVE_DIR / BY_PROJECT_DIR_NAME,
+        projects_dir=ARCHIVE_DIR / "projects", memories_dir=ARCHIVE_DIR / "memories",
+        overrides_file=ARCHIVE_DIR / projects.OVERRIDES_NAME)
+    return result
+
+
+def _head_text(path: str) -> str:
+    """Текст файла из последнего коммита (пустая строка, если его там нет)."""
+    old = subprocess.run(["git", "-c", "core.quotepath=false", "show", f"HEAD:{path}"],
+                         cwd=ARCHIVE_DIR, capture_output=True, text=True, encoding="utf-8")
+    return old.stdout if old.returncode == 0 else ""
+
+
+def _lines_added(old_body: str, new_body: str) -> int:
+    diff = difflib.unified_diff(old_body.splitlines(), new_body.splitlines(), lineterm="", n=0)
+    return sum(1 for ln in diff if ln.startswith("+") and not ln.startswith("+++"))
+
+
+def _chat_pairs(is_chat) -> tuple[dict[str, dict], dict[str, int]]:
+    """Изменённые файлы чатов парами «было → стало». Чат узнаём по хвосту имени файла
+    (первые 8 символов uuid): название и папка проекта могут меняться.
+    Второе значение — число изменённых файлов в остальных папках верхнего уровня."""
+    pairs: dict[str, dict] = {}
+    other: dict[str, int] = {}
+    for line in _git("status", "--porcelain", "-uall").splitlines():
+        code, path = line[:2].strip(), line[3:]
+        old_path = None
+        if " -> " in path:  # переименование, если изменения уже в индексе
+            old_path, path = (x.strip('"') for x in path.split(" -> ", 1))
+        path = path.strip('"')
+        parts = Path(path).parts
+        if is_chat(parts):
+            pair = pairs.setdefault(Path(path).stem.rsplit("_", 1)[-1], {})
+            if code in ("??", "A"):
+                pair["new"] = path
+            elif code == "D":
+                pair["old"] = path
+            else:
+                pair["new"], pair["old"] = path, old_path or path
+        elif parts[0] not in DERIVED_DIRS:
+            other[parts[0]] = other.get(parts[0], 0) + 1
+    return pairs, other
+
+
+def _versions(pair: dict) -> tuple[dict | None, dict | None]:
+    was = render.meta_of(_head_text(pair["old"])) if "old" in pair else None
+    now = (render.meta_of((ARCHIVE_DIR / pair["new"]).read_text(encoding="utf-8"))
+           if "new" in pair else None)
+    return was, now
 
 
 def summarize_changes() -> dict:
-    """Факты для сообщения коммита: какие чаты новые, продолжены, переименованы, удалены."""
-    new, deleted, modified, other = {}, {}, [], {}
-    for line in _git("status", "--porcelain", "-uall").splitlines():
-        code, path = line[:2], line[3:].strip('"')
-        parts = Path(path).parts
-        if parts[0] == CHATS_DIR_NAME and path.endswith(".md") and parts[-1] != render.INDEX_NAME:
-            key = Path(path).stem.rsplit("_", 1)[-1]  # хвост имени — первые 8 символов uuid чата
-            if code.strip() in ("??", "A"):
-                new[key] = render.title_of(ARCHIVE_DIR / path)
-            elif code.strip() == "D":
-                old = subprocess.run(["git", "-c", "core.quotepath=false", "show", f"HEAD:{path}"],
-                                     cwd=ARCHIVE_DIR, capture_output=True, text=True, encoding="utf-8")
-                deleted[key] = old.stdout.split("\n", 1)[0].lstrip("# ").strip() or path
-            else:
-                stat = _git("diff", "--numstat", "--", path).split()
-                modified.append({"title": render.title_of(ARCHIVE_DIR / path),
-                                 "lines_added": int(stat[0]) if stat and stat[0].isdigit() else None})
-        elif parts[0] != CHATS_DIR_NAME:
-            other[parts[0]] = other.get(parts[0], 0) + 1
-    renamed = [{"from": deleted.pop(k), "to": new.pop(k)} for k in list(new) if k in deleted]
-    updated = sorted(modified, key=lambda x: -(x["lines_added"] or 0))
+    """Факты для сообщения коммита: какие чаты новые, продолжены, переименованы, удалены
+    (по общему списку chats/) и какие перенесены в другой проект (по by_project/)."""
+    def flat(parts):
+        return (parts[0] == CHATS_DIR_NAME and parts[-1].endswith(".md")
+                and parts[-1] != render.INDEX_NAME)
+
+    def by_project(parts):
+        return (parts[0] == BY_PROJECT_DIR_NAME and len(parts) == 4
+                and parts[2] == render.CHATS_SUBDIR and parts[-1].endswith(".md"))
+
+    pairs, other = _chat_pairs(flat)
+    new, deleted, modified, renamed = [], [], [], []
+    for pair in pairs.values():
+        was, now = _versions(pair)
+        if was is None:
+            new.append(now["title"])
+        elif now is None:
+            deleted.append(was["title"] or pair["old"])
+        else:
+            if was["title"] != now["title"]:
+                renamed.append({"from": was["title"], "to": now["title"]})
+            if was["body"] != now["body"]:
+                modified.append({"title": now["title"],
+                                 "lines_added": _lines_added(was["body"], now["body"])})
+    updated = sorted(modified, key=lambda x: -x["lines_added"])
+
+    # Переносы между проектами видны только в раскладке по проектам. При первом её
+    # появлении старых версий нет, поэтому переносов тоже нет — и это правда.
+    moved, routes = [], {}
+    for pair in _chat_pairs(by_project)[0].values():
+        was, now = _versions(pair)
+        if was and now and was["project"] != now["project"]:
+            moved.append({"title": now["title"], "from_project": was["project"],
+                          "to_project": now["project"]})
+            key = f"{was['project']} → {now['project']}"
+            routes[key] = routes.get(key, 0) + 1
     # Лимит защищает контекст от аномально больших списков; если он сработал —
     # говорим об этом явно, а не заставляем модель догадываться по цифрам.
     return {
-        "new_chats": list(new.values())[:LIST_LIMIT], "new_count": len(new),
+        "new_chats": new[:LIST_LIMIT], "new_count": len(new),
         "new_chats_truncated": len(new) > LIST_LIMIT,
         "updated_chats": updated[:LIST_LIMIT], "updated_count": len(modified),
         "updated_chats_truncated": len(modified) > LIST_LIMIT,
-        "renamed_chats": renamed, "deleted_chats": list(deleted.values()),
+        "renamed_chats": renamed, "deleted_chats": deleted,
+        "moved_between_projects_count": len(moved),
+        "moved_between_projects_routes": routes,
+        "moved_between_projects": moved[:MOVED_LIMIT],
+        "moved_between_projects_truncated": len(moved) > MOVED_LIMIT,
         "other_changed_files_by_folder": other,
     }
 
 
-# ---------- Git ----------
 def _git(*args) -> str:
     r = subprocess.run(["git", "-c", "core.quotepath=false", *args], cwd=ARCHIVE_DIR, capture_output=True,
                        text=True, encoding="utf-8")
@@ -489,16 +580,19 @@ TOOLS = [
     _tool(prepare_repo,
           "Проверяет или клонирует локальный репозиторий архива. Вызови перед распаковкой."),
     _tool(unpack_to_archive,
-          "Распаковывает полученные zip в папку репозитория по категориям и сохраняет "
-          "манифест без ссылок.",
+          "Распаковывает полученные zip в папку репозитория по категориям, сохраняет "
+          "манифест без ссылок и копирует сами zip без изменений в archives/<время экспорта>/.",
           {"manifest_path": {"type": "string"}}, ["manifest_path"]),
     _tool(render_conversations,
-          "Раскладывает переписку по Markdown-файлам в chats/ (по файлу на чат + оглавление). "
-          "Вызывай после unpack_to_archive."),
+          "Раскладывает переписку по Markdown-файлам: chats/ — все чаты одним списком с оглавлением; "
+          "by_project/<проект>/ — чаты, документы и память по проектам. В by_project результата: "
+          "число чатов по проектам, число чатов без проекта и ошибки в файле ручных привязок "
+          "(override_errors). Вызывай после unpack_to_archive."),
     _tool(git_status, "Показывает изменения в репозитории перед коммитом."),
     _tool(summarize_changes,
           "Возвращает факты об изменениях в чатах: новые, продолженные (сколько строк добавлено), "
-          "переименованные, удалённые, плюс изменения в остальных папках. Используй для текста коммита."),
+          "переименованные, перенесённые в другой проект, удалённые, плюс изменения в остальных "
+          "папках. Используй для текста коммита."),
     _tool(git_commit_and_push,
           "Делает commit и push в приватный репозиторий. Человек подтвердит действие сам.",
           {"message": {"type": "string", "description": "Сообщение коммита: первая строка — краткий итог, затем пустая строка и подробности"}}, ["message"]),
